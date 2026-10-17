@@ -37,6 +37,7 @@ pip install bleak PySide6 qasync Pillow
 python -m venv venv
 venv\Scripts\activate
 pip install bleak PySide6 qasync Pillow
+py -m pip install bleak PySide6 qasync
 ```
 
 ---
