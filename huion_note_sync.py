@@ -29,9 +29,9 @@ from PySide6.QtGui import (
     QPainterPath, QPalette, QPen, QPixmap,
 )
 from PySide6.QtWidgets import (
-    QAbstractItemView, QApplication, QCheckBox, QComboBox, QFileDialog, QFrame, QGridLayout, QHBoxLayout,
+    QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog, QFileDialog, QFrame, QGridLayout, QHBoxLayout,
     QHeaderView, QLabel, QLineEdit, QListWidget, QListWidgetItem, QMainWindow, QMenu, QProgressBar,
-    QPushButton, QScrollArea, QSpinBox, QSplitter, QStackedWidget, QTabWidget, QTableWidget,
+    QPushButton, QScrollArea, QSlider, QSpinBox, QSplitter, QStackedWidget, QTabWidget, QTableWidget,
     QTableWidgetItem, QTextEdit, QToolButton, QVBoxLayout, QWidget,
 )
 try:  # Los iconos vectoriales son opcionales: sin QtSvg la aplicación funciona igual, solo con texto.
@@ -41,7 +41,7 @@ except ImportError:  # pragma: no cover
 from qasync import QEventLoop
 
 APP_NAME = "Huion Note Sync"
-APP_VERSION = "3.0.0"
+APP_VERSION = "3.1.0"
 ORG_NAME = "HuionNoteTools"
 
 SERVICE_UUID = "0000ffe0-0000-1000-8000-00805f9b34fb"
@@ -67,7 +67,8 @@ DEFAULT_MAX_Y = 37400
 DEFAULT_MAX_PRESSURE = 8191
 PAGE_WIDTH = 794
 PAGE_HEIGHT = 1123
-LIVE_PAGE_BASE = 10000  # las páginas guardadas desde la escucha pasiva se numeran a partir de aquí
+LIVE_PAGE_BASE = 10000   # las páginas guardadas desde la escucha pasiva se numeran a partir de aquí
+SPLIT_PAGE_BASE = 20000  # partes de una página dividida: 20000 + página × 10 + número de parte
 
 
 
@@ -483,6 +484,28 @@ class PageStore:
         columns = {row[1] for row in self.db.execute("PRAGMA table_info(pages)")}
         if "points_json" not in columns:
             self.db.execute("ALTER TABLE pages ADD COLUMN points_json TEXT NOT NULL DEFAULT ''")
+        # Cortes de las páginas que el usuario ha dividido (índices de trazo): se reaplican en cada sincronización.
+        self.db.execute("CREATE TABLE IF NOT EXISTS page_splits(page INTEGER PRIMARY KEY, cuts TEXT NOT NULL)")
+        self.db.commit()
+
+    def get_split(self, page: int) -> Optional[list[int]]:
+        row = self.db.execute("SELECT cuts FROM page_splits WHERE page=?", (page,)).fetchone()
+        return json.loads(row[0]) if row else None
+
+    def all_splits(self) -> dict[int, list[int]]:
+        return {page: json.loads(cuts) for page, cuts in self.db.execute("SELECT page, cuts FROM page_splits")}
+
+    def set_split(self, page: int, cuts: list[int]) -> None:
+        self.db.execute("INSERT OR REPLACE INTO page_splits VALUES(?,?)", (page, json.dumps(sorted(cuts))))
+        self.db.commit()
+
+    def delete_split(self, page: int) -> None:
+        self.db.execute("DELETE FROM page_splits WHERE page=?", (page,))
+        self.db.commit()
+
+    def delete_pages(self, keys: list[int]) -> None:
+        for key in keys:
+            self.db.execute("DELETE FROM pages WHERE logical_page=?", (key,))
         self.db.commit()
 
     def exists(self, device_id: str, digest: str) -> bool:
@@ -865,10 +888,18 @@ class BleManager:
                 pass
         return 20
 
+    async def settle_stream(self) -> None:
+        """Antes de pedir una página, descarta cualquier paquete rezagado de la anterior para no mezclarlos."""
+        for _ in range(6):
+            self.clear_queue(OP_REQUEST_OFFLINE_DATA)
+            self.clear_queue(OP_RETURN_OFFLINE_DATA)
+            await asyncio.sleep(0.15)
+            if self.queue(OP_RETURN_OFFLINE_DATA).empty() and self.queue(OP_REQUEST_OFFLINE_DATA).empty():
+                return
+
     async def _download_page_once(self, page: int, progress) -> tuple[list[PenPoint], bool]:
         """Descarga una página. Devuelve (puntos, completa)."""
-        self.clear_queue(OP_REQUEST_OFFLINE_DATA)
-        self.clear_queue(OP_RETURN_OFFLINE_DATA)
+        await self.settle_stream()
         low, high = page & 255, (page >> 8) & 255
         await self.send(Protocol.command(OP_REQUEST_OFFLINE_DATA, low, high))
         try:
@@ -893,6 +924,18 @@ class BleManager:
             if 0 <= sequence <= expected and sequence not in packets:
                 packets[sequence] = frame
             progress(len(packets), expected)
+
+        if len(packets) >= expected:
+            # Diagnóstico: ¿el dispositivo sigue enviando paquetes tras los anunciados? Si fueran de otra página,
+            # mezclarían contenidos; aquí se cuentan, se registran (con su numeración) y se descartan.
+            await asyncio.sleep(0.2)
+            leftovers: list[int] = []
+            queue = self.queue(OP_RETURN_OFFLINE_DATA)
+            while not queue.empty():
+                leftovers.append(Protocol.u16(queue.get_nowait()))
+            if leftovers:
+                self.log(f"Página {page}: llegaron {len(leftovers)} paquetes de más tras los {expected} anunciados "
+                         f"(secuencias {leftovers[:12]}); se descartan.")
 
         points: list[PenPoint] = []
         for sequence in sorted(packets):
@@ -1573,6 +1616,80 @@ def accuracy_scores(reference: str, recognized: str, loose: bool) -> tuple[float
     return char_acc, word_acc
 
 
+# --------------------------------------------------------------------------------------------------
+# Páginas mezcladas: el Huion Note solo crea una página nueva al pulsar su botón de función. Si se pasa de hoja
+# sin pulsarlo, ambas hojas quedan en la misma página, superpuestas. Como los trazos se guardan en orden
+# cronológico, se pueden separar eligiendo en qué trazo empieza la segunda hoja.
+# --------------------------------------------------------------------------------------------------
+def split_key(page: int, part: int) -> int:
+    return SPLIT_PAGE_BASE + page * 10 + min(part, 9)
+
+
+def page_sort_key(page: int) -> tuple:
+    """Orden de la lista: páginas del dispositivo (con sus partes juntas) y, al final, las escritas en directo."""
+    if page >= SPLIT_PAGE_BASE:
+        root, part = divmod(page - SPLIT_PAGE_BASE, 10)
+        return (root, part + 1)
+    if page >= LIVE_PAGE_BASE:
+        return (page + 1_000_000, 0)
+    return (page, 0)
+
+
+def page_tag(page: int) -> str:
+    """Etiqueta corta para los nombres de archivo."""
+    if page >= SPLIT_PAGE_BASE:
+        root, part = divmod(page - SPLIT_PAGE_BASE, 10)
+        return f"{root:03d}p{part + 1}"
+    if page >= LIVE_PAGE_BASE:
+        return f"vivo{page - LIVE_PAGE_BASE:03d}"
+    return f"{page:03d}"
+
+
+def strokes_to_points(strokes: list[list[PenPoint]]) -> list[PenPoint]:
+    """Aplana trazos en una lista de puntos poniendo un «lápiz levantado» entre cada uno (si no, se fusionarían)."""
+    points: list[PenPoint] = []
+    for stroke in strokes:
+        points.extend(stroke)
+        last = stroke[-1]
+        points.append(PenPoint(last.x, last.y, 0, False, last.timestamp, 0))
+    return points
+
+
+def split_strokes(strokes: list[list[PenPoint]], cuts: list[int]) -> list[list[list[PenPoint]]]:
+    edges = [0] + sorted({c for c in cuts if 0 < c < len(strokes)}) + [len(strokes)]
+    return [strokes[a:b] for a, b in zip(edges, edges[1:]) if b > a]
+
+
+def suggest_split(strokes: list[list[PenPoint]], max_y: int, threshold: float = 0.2) -> Optional[int]:
+    """Índice del trazo donde probablemente empieza la segunda hoja: la escritura baja por la página y, al
+    cambiar de hoja, vuelve de golpe arriba. Devuelve None si no hay un salto hacia arriba suficientemente claro."""
+    total = len(strokes)
+    if total < 8:
+        return None
+    centers = [sum(p.y for p in stroke) / len(stroke) for stroke in strokes]
+    window = max(3, total // 25)
+    best_index, best_drop = None, 0.0
+    for index in range(window, total - window + 1):
+        before = _median(centers[index - window:index])
+        after = _median(centers[index:index + window])
+        if before - after > best_drop:
+            best_index, best_drop = index, before - after
+    if best_index is None or best_drop < threshold * max(1, max_y):
+        return None
+    # Ajuste fino: el corte exacto es el mayor salto hacia arriba cerca del candidato.
+    nearby = range(max(1, best_index - window), min(total, best_index + window + 1))
+    return max(nearby, key=lambda j: centers[j - 1] - centers[j])
+
+
+def shared_point_ratio(a: list[PenPoint], b: list[PenPoint]) -> float:
+    """Fracción de puntos (x, y, presión) de la lista más corta que aparecen idénticos en la otra."""
+    small, large = (a, b) if len(a) <= len(b) else (b, a)
+    if not small:
+        return 0.0
+    known = {(p.x, p.y, p.pressure) for p in large}
+    return sum(1 for p in small if (p.x, p.y, p.pressure) in known) / len(small)
+
+
 class Canvas(QWidget):
     count_changed = Signal(int)
 
@@ -1694,6 +1811,98 @@ class Canvas(QWidget):
         for stroke in self.strokes:
             self.draw_stroke(painter, stroke, rect)
         self.draw_stroke(painter, self.current, rect)
+
+
+class SplitDialog(QDialog):
+    """Divide una página mezclada en dos hojas eligiendo el trazo donde empieza la segunda."""
+
+    def __init__(self, parent, strokes, max_x: int, max_y: int, max_pressure: int, suggestion: Optional[int]):
+        super().__init__(parent)
+        self.setWindowTitle("Dividir página")
+        self.resize(1000, 680)
+        self.strokes = strokes
+        self.total = len(strokes)
+        self.max_y = max_y
+        self.cut = min(max(1, suggestion or self.total // 2), self.total - 1)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(18, 16, 18, 16)
+        root.setSpacing(10)
+        intro = QLabel(
+            "Cuando se pasa de hoja sin pulsar el botón de función del Huion Note, las dos hojas quedan en una sola "
+            "página. Los trazos se guardan en el orden en que se escribieron: mueve el corte hasta que a la izquierda "
+            "quede solo la primera hoja y a la derecha solo la segunda."
+        )
+        intro.setWordWrap(True)
+        intro.setObjectName("subtitle")
+        root.addWidget(intro)
+
+        panes = QHBoxLayout()
+        panes.setSpacing(12)
+        self.left, self.right = Canvas(), Canvas()
+        self.left_title, self.right_title = QLabel(""), QLabel("")
+        for title, canvas in ((self.left_title, self.left), (self.right_title, self.right)):
+            canvas.set_limits(max_x, max_y, max_pressure)
+            canvas.setMinimumSize(300, 380)
+            canvas.set_theme(parent.canvas.bg_color, parent.canvas.border_color, parent.canvas.muted_color)
+            title.setObjectName("section")
+            column = QVBoxLayout()
+            column.addWidget(title)
+            column.addWidget(canvas, 1)
+            panes.addLayout(column, 1)
+        root.addLayout(panes, 1)
+
+        row = QHBoxLayout()
+        self.back_button = QPushButton("‹")
+        self.back_button.setObjectName("icon")
+        self.forward_button = QPushButton("›")
+        self.forward_button.setObjectName("icon")
+        self.slider = QSlider(Qt.Orientation.Horizontal)
+        self.slider.setRange(1, self.total - 1)
+        self.slider.setValue(self.cut)
+        self.slider.setPageStep(max(1, self.total // 20))
+        self.position_label = QLabel("")
+        self.position_label.setObjectName("subtitle")
+        self.suggest_button = QPushButton("Sugerir corte")
+        row.addWidget(self.back_button)
+        row.addWidget(self.slider, 1)
+        row.addWidget(self.forward_button)
+        row.addWidget(self.position_label)
+        row.addWidget(self.suggest_button)
+        root.addLayout(row)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        cancel = QPushButton("Cancelar")
+        accept = QPushButton("Dividir aquí")
+        accept.setObjectName("primary")
+        buttons.addWidget(cancel)
+        buttons.addWidget(accept)
+        root.addLayout(buttons)
+
+        self.slider.valueChanged.connect(self.on_value)
+        self.back_button.clicked.connect(lambda: self.slider.setValue(self.slider.value() - 1))
+        self.forward_button.clicked.connect(lambda: self.slider.setValue(self.slider.value() + 1))
+        self.suggest_button.clicked.connect(self.suggest)
+        cancel.clicked.connect(self.reject)
+        accept.clicked.connect(self.accept)
+        self.update_preview()
+
+    def suggest(self):
+        index = suggest_split(self.strokes, self.max_y, threshold=0.0)
+        if index is not None:
+            self.slider.setValue(index)
+
+    def on_value(self, value: int):
+        self.cut = value
+        self.update_preview()
+
+    def update_preview(self):
+        self.left.set_points(strokes_to_points(self.strokes[:self.cut]))
+        self.right.set_points(strokes_to_points(self.strokes[self.cut:]))
+        self.left_title.setText(f"Primera hoja · {self.cut} trazos")
+        self.right_title.setText(f"Segunda hoja · {self.total - self.cut} trazos")
+        self.position_label.setText(f"Corte tras el trazo {self.cut} de {self.total}")
 
 
 class MeasurePage(QWidget):
@@ -1870,7 +2079,7 @@ class MeasurePage(QWidget):
     def refresh_pages(self):
         current = self.page_combo.currentData()
         self.page_combo.clear()
-        for page in sorted(self.owner.synced_pages):
+        for page in sorted(self.owner.synced_pages, key=page_sort_key):
             self.page_combo.addItem(self.owner.page_label(page), page)
         if current is not None:
             index = self.page_combo.findData(current)
@@ -2115,10 +2324,13 @@ class MainWindow(QMainWindow):
                 if txt_path and txt_path.exists():
                     self.ocr_texts[digest] = txt_path.read_text(encoding="utf-8")
 
-            if self.synced_pages:
-                self.current_preview_page = min(self.synced_pages.keys())
-            live_keys = [key for key in self.synced_pages if key >= LIVE_PAGE_BASE]
+            live_keys = [key for key in self.synced_pages if LIVE_PAGE_BASE <= key < SPLIT_PAGE_BASE]
             self.live_key_counter = max(live_keys) if live_keys else LIVE_PAGE_BASE
+            for root in self.store.all_splits():  # una página dividida se muestra solo por sus hojas
+                if any(SPLIT_PAGE_BASE + root * 10 <= key < SPLIT_PAGE_BASE + root * 10 + 10 for key in self.synced_pages):
+                    self.synced_pages.pop(root, None)
+            if self.synced_pages:
+                self.current_preview_page = min(self.synced_pages, key=page_sort_key)
         except Exception as error:
             print(f"Error al cargar páginas previas: {error}")
 
@@ -2141,6 +2353,9 @@ class MainWindow(QMainWindow):
 
     @staticmethod
     def page_label(page: int) -> str:
+        if page >= SPLIT_PAGE_BASE:
+            root, part = divmod(page - SPLIT_PAGE_BASE, 10)
+            return f"Pág. {root} · hoja {part + 1}"
         return f"En vivo {page - LIVE_PAGE_BASE}" if page >= LIVE_PAGE_BASE else f"Pág. {page}"
 
     def page_digest(self, page: int) -> str:
@@ -2322,6 +2537,8 @@ class MainWindow(QMainWindow):
         self.zoom_in_btn.setObjectName("icon")
         self.points_label = QLabel("0 puntos")
         self.points_label.setObjectName("subtitle")
+        self.split_button = QPushButton("Dividir página")
+        self.merge_button = QPushButton("Unir hojas")
         self.clear_button = QPushButton("Limpiar vista")
         bar.addWidget(self.prev_page_btn)
         bar.addWidget(self.page_indicator)
@@ -2331,6 +2548,8 @@ class MainWindow(QMainWindow):
         bar.addWidget(self.zoom_out_btn)
         bar.addWidget(self.zoom_label)
         bar.addWidget(self.zoom_in_btn)
+        bar.addWidget(self.split_button)
+        bar.addWidget(self.merge_button)
         bar.addWidget(self.clear_button)
         preview_layout.addLayout(bar)
         self.canvas = Canvas()
@@ -2650,6 +2869,8 @@ class MainWindow(QMainWindow):
         self.zoom_in_btn.clicked.connect(lambda: self.set_zoom(self.zoom + 0.25))
         self.zoom_out_btn.clicked.connect(lambda: self.set_zoom(self.zoom - 0.25))
         self.clear_button.clicked.connect(self.clear_preview)
+        self.split_button.clicked.connect(self.open_split_dialog)
+        self.merge_button.clicked.connect(self.merge_current_split)
         self.page_list.currentItemChanged.connect(self.on_page_selected)
         self.page_search.textChanged.connect(lambda _t: self.filter_pages())
         self.history_table.cellDoubleClicked.connect(self.open_history_file)
@@ -2728,7 +2949,7 @@ class MainWindow(QMainWindow):
         max_x, max_y = self.manager.protocol.max_x, self.manager.protocol.max_y
         self.page_list.blockSignals(True)
         self.page_list.clear()
-        for page in sorted(self.synced_pages):
+        for page in sorted(self.synced_pages, key=page_sort_key):
             digest = self.page_digest(page)
             icon = self.thumb_cache.get(digest)
             if icon is None:
@@ -2802,7 +3023,7 @@ class MainWindow(QMainWindow):
     def change_preview_page(self, delta: int):
         if not self.synced_pages or self.manager.online_enabled:
             return
-        pages = sorted(self.synced_pages.keys())
+        pages = sorted(self.synced_pages, key=page_sort_key)
         if self.current_preview_page in pages:
             idx = pages.index(self.current_preview_page)
             new_idx = max(0, min(len(pages) - 1, idx + delta))
@@ -2818,7 +3039,7 @@ class MainWindow(QMainWindow):
             digest = self.page_digest(page)
             self.canvas.set_points(self.synced_pages[page])
             self.shown_digest = digest
-            pages = sorted(self.synced_pages.keys())
+            pages = sorted(self.synced_pages, key=page_sort_key)
             self.page_indicator.setText(f"{self.page_label(page)} · {pages.index(page) + 1}/{len(pages)}")
             text = self.ocr_texts.get(digest, "")
             self.set_ocr_text(text, None if text else "Sin transcripción: pulsa «Reconocer»")
@@ -2828,6 +3049,13 @@ class MainWindow(QMainWindow):
             self.shown_digest = ""
             self.page_indicator.setText("Página —")
             self.set_ocr_text("")
+        self.update_split_buttons()
+
+    def update_split_buttons(self):
+        page = self.current_preview_page
+        shown = bool(self.shown_digest) and not self.manager.online_enabled and page is not None
+        self.split_button.setEnabled(shown and not (LIVE_PAGE_BASE <= page < SPLIT_PAGE_BASE))
+        self.merge_button.setEnabled(shown and page >= SPLIT_PAGE_BASE)
 
     def update_nav_enabled(self):
         live = self.manager.online_enabled
@@ -2835,6 +3063,7 @@ class MainWindow(QMainWindow):
             widget.setEnabled(not live)
         if live:
             self.page_indicator.setText("En directo")
+        self.update_split_buttons()
 
     def scan_input_devices(self):
         self.devices_button.setEnabled(False)
@@ -2988,6 +3217,7 @@ class MainWindow(QMainWindow):
                 self.skip_saved.isChecked(),
             )
             self.add_log(f"Sincronización finalizada: {checked} páginas revisadas, {nonempty} con contenido.")
+            self.report_page_overlap()
             self.page_progress.setValue(100)
             self.refresh_history()
             message = f"Sincronización terminada: {nonempty} página" + ("s" if nonempty != 1 else "") + " con contenido."
@@ -3057,7 +3287,7 @@ class MainWindow(QMainWindow):
 
         folder = self.output / datetime.now().strftime("%Y-%m-%d")
         folder.mkdir(parents=True, exist_ok=True)
-        base = f"huion_{page:03d}_{datetime.now():%Y%m%d_%H%M%S}_{digest[:8]}"
+        base = f"huion_{page_tag(page)}_{datetime.now():%Y%m%d_%H%M%S}_{digest[:8]}"
         png_path, txt_path = folder / f"{base}.png", folder / f"{base}.txt"
         max_x, max_y = self.manager.protocol.max_x, self.manager.protocol.max_y
         strokes = Protocol.strokes(points, max_x, max_y)
@@ -3086,15 +3316,115 @@ class MainWindow(QMainWindow):
         return digest, txt_path, True
 
     def save_page(self, page, points):
-        """Página recibida por sincronización: se guarda, se muestra y se lanza su OCR."""
+        """Página recibida por sincronización. Si el usuario la dividió antes, se vuelve a dividir igual."""
         points = self.clean_points(points)
+        cuts = self.store.get_split(page)
+        if cuts:
+            strokes = Protocol.strokes(points, self.manager.protocol.max_x, self.manager.protocol.max_y)
+            parts = split_strokes(strokes, cuts)
+            if len(parts) > 1:
+                self.remove_page_keys([page])
+                for number, part in enumerate(parts[:10]):
+                    self.save_one(split_key(page, number), strokes_to_points(part), select=(number == 0))
+                return
+        self.save_one(page, points)
+
+    def save_one(self, page, points, select: bool = True):
         digest, txt_path, created = self.persist_page(page, points)
-        self.register_page(page, points, show=self.show_page.isChecked(), select=True)
+        self.register_page(page, points, show=self.show_page.isChecked() and select, select=select)
         if created:
             self.refresh_history()
-            self.add_log(f"Página {page} sincronizada y guardada (PNG).")
+            strokes = Protocol.strokes(points, self.manager.protocol.max_x, self.manager.protocol.max_y)
+            self.add_log(f"{self.page_label(page)} sincronizada y guardada (PNG): {len(points)} puntos, {len(strokes)} trazos.")
+            if page < LIVE_PAGE_BASE:
+                self.maybe_hint_split(page, strokes)
         if digest not in self.ocr_texts:
             self.schedule(self.ocr_saved_page(page, points, digest, txt_path))
+
+    def maybe_hint_split(self, page: int, strokes):
+        if suggest_split(strokes, self.manager.protocol.max_y, threshold=0.35) is not None:
+            self.add_log(f"La página {page} parece contener dos hojas superpuestas (la escritura vuelve arriba a mitad de página).")
+            self.show_toast(f"La página {page} parece mezclar dos hojas. Ábrela y pulsa «Dividir página».", "warn", 9000)
+
+    def report_page_overlap(self):
+        """Diagnóstico: páginas distintas con puntos idénticos indicarían datos repetidos o paquetes mezclados."""
+        pages = sorted(key for key in self.synced_pages if key < LIVE_PAGE_BASE)
+        for first, second in zip(pages, pages[1:]):
+            ratio = shared_point_ratio(self.synced_pages[first], self.synced_pages[second])
+            if ratio >= 0.2:
+                self.add_log(f"AVISO: las páginas {first} y {second} comparten el {ratio:.0%} de sus puntos exactos; "
+                             "el dispositivo está repitiendo datos o se mezclan paquetes entre páginas.")
+
+    # ------------------------------------------------------------------ Dividir y unir hojas
+    def remove_page_keys(self, keys):
+        for key in keys:
+            self.synced_pages.pop(key, None)
+            self.digest_cache.pop(key, None)
+        self.store.delete_pages(list(keys))
+
+    def part_keys(self, root: int) -> list[int]:
+        low = SPLIT_PAGE_BASE + root * 10
+        return sorted(key for key in self.synced_pages if low <= key < low + 10)
+
+    def open_split_dialog(self):
+        page = self.current_preview_page
+        if page is None or page not in self.synced_pages or self.manager.online_enabled:
+            return
+        if LIVE_PAGE_BASE <= page < SPLIT_PAGE_BASE:
+            self.show_toast("Solo se pueden dividir páginas sincronizadas desde el dispositivo.", "warn")
+            return
+        protocol = self.manager.protocol
+        strokes = Protocol.strokes(self.synced_pages[page], protocol.max_x, protocol.max_y)
+        if len(strokes) < 4:
+            self.show_toast("Hay muy pocos trazos para dividir esta página.", "warn")
+            return
+        dialog = SplitDialog(self, strokes, protocol.max_x, protocol.max_y, protocol.max_pressure,
+                             suggest_split(strokes, protocol.max_y))
+        if dialog.exec():
+            self.apply_split(page, dialog.cut)
+
+    def apply_split(self, page: int, cut: int):
+        """Registra el corte (índice de trazo) y rehace las hojas de la página original."""
+        protocol = self.manager.protocol
+        if page >= SPLIT_PAGE_BASE:  # se corta una hoja ya dividida: el corte se expresa respecto a la página original
+            root = (page - SPLIT_PAGE_BASE) // 10
+            keys = self.part_keys(root)
+            per_part = [Protocol.strokes(self.synced_pages[k], protocol.max_x, protocol.max_y) for k in keys]
+            all_strokes = [stroke for part in per_part for stroke in part]
+            offset = sum(len(part) for part in per_part[:keys.index(page)])
+            cuts = (self.store.get_split(root) or []) + [offset + cut]
+        else:
+            root = page
+            all_strokes = Protocol.strokes(self.synced_pages[page], protocol.max_x, protocol.max_y)
+            cuts = [cut]
+        cuts = sorted({c for c in cuts if 0 < c < len(all_strokes)})
+        if not cuts:
+            return
+        self.store.set_split(root, cuts)
+        self.rebuild_parts(root, all_strokes, cuts)
+
+    def rebuild_parts(self, root: int, all_strokes, cuts):
+        self.remove_page_keys([root] + self.part_keys(root))
+        parts = split_strokes(all_strokes, cuts)[:10]
+        for number, part in enumerate(parts):
+            self.save_one(split_key(root, number), strokes_to_points(part), select=False)
+        self.current_preview_page = split_key(root, 0)
+        self.refresh_page_list()
+        self.update_canvas_display()
+        self.show_toast(f"Página {root} dividida en {len(parts)} hojas.", "ok")
+
+    def merge_current_split(self):
+        page = self.current_preview_page
+        if page is None or page < SPLIT_PAGE_BASE:
+            return
+        root = (page - SPLIT_PAGE_BASE) // 10
+        protocol = self.manager.protocol
+        keys = self.part_keys(root)
+        merged = [stroke for k in keys for stroke in Protocol.strokes(self.synced_pages[k], protocol.max_x, protocol.max_y)]
+        self.store.delete_split(root)
+        self.remove_page_keys(keys)
+        self.save_one(root, strokes_to_points(merged), select=True)
+        self.show_toast(f"Hojas de la página {root} unidas de nuevo.", "ok")
 
     # ------------------------------------------------------------------ Escritura en directo: guardado automático por página
     def next_live_key(self) -> int:
@@ -3320,7 +3650,7 @@ class MainWindow(QMainWindow):
     def export_markdown(self):
         self.commit_text_edits()
         parts = []
-        for page in sorted(self.synced_pages):
+        for page in sorted(self.synced_pages, key=page_sort_key):
             text = self.ocr_texts.get(self.page_digest(page), "").strip()
             if text:
                 parts.append(f"## {self.page_label(page)}\n\n{text}")
